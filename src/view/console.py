@@ -6,10 +6,16 @@ import curses
 import curses.textpad
 import logging
 import locale
+
+from core.byte_channels import ByteInputChannel
 from core.channels import InputChannel
 
 locale.setlocale(locale.LC_ALL, '')
 code = locale.getpreferredencoding()
+
+import platform
+if platform.python_version_tuple()[0] == '2':
+    from kitchen.text.converters import to_unicode
 
 
 class BaseView(object):
@@ -94,7 +100,7 @@ class BaseView(object):
 
 class ConsoleView(BaseView):
 
-    def __init__(self, env, session, serializer, show_world=False):
+    def __init__(self, env, session, serializer, show_world=False, byte_channels=False):
         super(ConsoleView, self).__init__(env, session)
 
         # for visualization purposes, we keep an internal buffer of the
@@ -102,11 +108,19 @@ class ConsoleView(BaseView):
         # task, we can keep the history intact.
         self.input_buffer = ''
         self.output_buffer = ''
+        self.reward_buffer = ''
         self.panic = 'SKIP'
-        # record what the learner says
-        self._learner_channel = InputChannel(serializer)
-        # record what the environment says
-        self._env_channel = InputChannel(serializer)
+        if byte_channels:
+            # record what the learner says
+            self._learner_channel = ByteInputChannel(serializer)
+            # record what the environment says
+            self._env_channel = ByteInputChannel(serializer)
+        else:
+            # record what the learner says
+            self._learner_channel = InputChannel(serializer)
+            # record what the environment says
+            self._env_channel = InputChannel(serializer)
+
         # listen to the updates in these channels
         self._learner_channel.sequence_updated.register(
             self.on_learner_sequence_updated)
@@ -125,11 +139,24 @@ class ConsoleView(BaseView):
         session.learner_token_updated.register(self.on_learner_token_updated)
         del self.info['current_task']
 
+    def on_total_reward_updated(self, reward):
+        change = reward - self.info['reward']
+        BaseView.on_total_reward_updated(self, reward)
+        self.reward_buffer = "_" * self._scroll_msg_length + self.reward_buffer + self.encode_reward(change)
+        self.reward_buffer = self.reward_buffer[-self._scroll_msg_length+11:]
+        self._win.addstr(self._reward_seq_y, 0, self.reward_buffer)
+        self._win.refresh()
+
+    @staticmethod
+    def encode_reward(reward):
+        d = {0: " ", 1: "+", -1: "-", 2: "2", -2: "\u01BB"}
+        return d[reward]
+
     def on_env_token_updated(self, token):
-        self._env_channel.consume_bit(token)
+        self._env_channel.consume(token)
 
     def on_learner_token_updated(self, token):
-        self._learner_channel.consume_bit(token)
+        self._learner_channel.consume(token)
 
     def on_learner_message_updated(self, message):
         # we use the fact that messages arrive character by character
@@ -137,16 +164,16 @@ class ConsoleView(BaseView):
             self.input_buffer += self._learner_channel.get_text()[-1]
             self.input_buffer = self.input_buffer[-self._scroll_msg_length:]
             learner_input = self.channel_to_str(
-                self.input_buffer,
+                self.input_buffer + ' ',
                 self._learner_channel.get_undeserialized())
-            self._win.addstr(self._learner_seq_y, 0, learner_input.encode(code))
+            self._win.addstr(self._learner_seq_y, 0, learner_input.encode(code).decode(code))
             self._win.refresh()
 
     def on_learner_sequence_updated(self, sequence):
         learner_input = self.channel_to_str(
-            self.input_buffer,
+            self.input_buffer + ' ',
             self._learner_channel.get_undeserialized())
-        self._win.addstr(self._learner_seq_y, 0, learner_input.encode(code))
+        self._win.addstr(self._learner_seq_y, 0, learner_input.encode(code).decode(code))
         self._win.refresh()
 
     def on_env_message_updated(self, message):
@@ -157,14 +184,14 @@ class ConsoleView(BaseView):
             env_output = self.channel_to_str(
                 self.output_buffer,
                 self._env_channel.get_undeserialized())
-            self._win.addstr(self._teacher_seq_y, 0, env_output.encode(code))
+            self._win.addstr(self._teacher_seq_y, 0, env_output.encode(code).decode(code))
             self._win.refresh()
 
     def on_env_sequence_updated(self, sequence):
         env_output = self.channel_to_str(
             self.output_buffer,
             self._env_channel.get_undeserialized())
-        self._win.addstr(self._teacher_seq_y, 0, env_output.encode(code))
+        self._win.addstr(self._teacher_seq_y, 0, env_output.encode(code).decode(code))
         self._win.refresh()
 
     def on_world_updated(self, world):
@@ -187,11 +214,12 @@ class ConsoleView(BaseView):
         begin_y = 0
         self._teacher_seq_y = 0
         self._learner_seq_y = 1
-        self._world_win_y = 3
+        self._reward_seq_y = 2
+        self._world_win_y = 4
         self._world_win_x = 0
         self._info_win_width = 20
-        self._info_win_height = 2
-        self._user_input_win_y = 2
+        self._info_win_height = 4
+        self._user_input_win_y = 4
         self._user_input_win_x = 10
         self.height, self.width = self._stdscr.getmaxyx()
         self._scroll_msg_length = self.width - self._info_win_width - 1
@@ -228,7 +256,10 @@ class ConsoleView(BaseView):
             0,
             self.width - self._user_input_win_x).decode(code)
         curses.noecho()
+        if platform.python_version_tuple()[0] == '2':
+            inputstr = to_unicode(inputstr)
         self._user_input_win.clear()
+
         if inputstr == self.panic:
             inputstr = ''
             self._env._task_time = float('inf')

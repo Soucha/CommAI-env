@@ -12,7 +12,7 @@ from __future__ import unicode_literals
 import subprocess
 
 
-class BaseLearner:
+class BaseLearner(object):
     def try_reward(self, reward):
         if reward is not None:
             self.reward(reward)
@@ -28,28 +28,50 @@ class BaseLearner:
 
 
 class RemoteLearner(BaseLearner):
-    def __init__(self, cmd, port):
+    def __init__(self, cmd, port, address=None):
         try:
             import zmq
         except ImportError:
             raise ImportError("Must have zeromq for remote learner.")
 
-        self.port = port if port is not None else 5556
+        if address is None:
+            address = '*'
+
+        if port is None:
+            port = 5556
+        elif int(port) < 1 or int(port) > 65535:
+            raise ValueError("Invalid port number: %s" % port)
+
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PAIR)
-        self.socket.bind("tcp://*:%s" % port)
+        self.socket.bind("tcp://%s:%s" % (address, port))
 
         # launch learner
-        subprocess.Popen((cmd + ' ' + str(self.port)).split())
-        handshake_in = self.socket.recv()
+        if cmd is not None:
+            subprocess.Popen((cmd + ' ' + str(port)).split())
+        handshake_in = self.socket.recv().decode('utf-8')
         assert handshake_in == 'hello'  # handshake
 
     # send to learner, and get response;
     def next(self, inp):
-        self.socket.send(str(inp))
-        reply = self.socket.recv()
+        self.socket.send_string(str(inp))
+        reply = self.receive_socket()
         return reply
 
     def try_reward(self, reward):
         reward = reward if reward is not None else 0
-        self.socket.send(str(reward))
+        self.socket.send_string(str(reward))
+
+    def receive_socket(self):
+        reply = self.socket.recv()
+        if type(reply) == type(b''):
+            reply = reply.decode('utf-8')
+        return reply
+
+    def set_view(self, view):
+        pass
+
+
+class RemoteTimedLearner(BaseLearner):
+    def __init__(self, cmd, port, address=None):
+        super().__init__(cmd, port, address)
