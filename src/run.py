@@ -19,7 +19,6 @@ from core.environment import Environment
 from core.config_loader import JSONConfigLoader, PythonConfigLoader
 import learners
 from core.session import Session
-from view.console import ConsoleView, BaseView
 
 
 def main():
@@ -46,12 +45,18 @@ def main():
     op.add_option('--learner-cmd',
                   help='The cmd to run to launch RemoteLearner.')
     op.add_option('--learner-port',
-                  default=5556,
+                  default=5556, type=int,
                   help='Port on which to accept remote learner.')
+    op.add_option('--learner-address',
+                  help='Network address on which the remote learner listens.')
     op.add_option('--max-reward-per-task',
-                  default=10, type=int,
+                  default=2147483647, type=int,
                   help='Maximum reward that we can give to a learner for'
                   ' a given task.')
+    op.add_option('--curses', action='store_true', default=False,
+                  help='Uses standard output instead of curses library.')
+    op.add_option('--bit-mode', action='store_true', default=False,
+                  help='Environment receives input in bytes.')
     opt, args = op.parse_args()
     if len(args) == 0:
         op.error("Tasks schedule configuration file required.")
@@ -63,18 +68,18 @@ def main():
     # the bit signal
     serializer = StandardSerializer()
     # create a learner (the human learner takes the serializer)
-    learner = create_learner(opt.learner, serializer, opt.learner_cmd,
-                                opt.learner_port)
+    learner = create_learner(opt.learner, serializer,
+                             opt.learner_cmd, opt.learner_port, opt.learner_address, not opt.bit_mode)
     # create our tasks and put them into a scheduler to serve them
     task_scheduler = create_tasks_from_config(tasks_config_file)
     # construct an environment
     env = Environment(serializer, task_scheduler, opt.scramble,
-                      opt.max_reward_per_task)
+                      opt.max_reward_per_task, not opt.bit_mode)
     # a learning session
     session = Session(env, learner, opt.time_delay)
     # setup view
-    view = create_view(opt.view, opt.learner, env, session, serializer,
-                        opt.show_world)
+    view = create_view(opt.view, opt.learner, env, session, serializer, opt.show_world,
+                       opt.curses, not opt.bit_mode)
     try:
         # send the interface to the human learner
         learner.set_view(view)
@@ -93,17 +98,32 @@ def main():
         view.finalize()
 
 
-def create_view(view_type, learner_type, env, session, serializer, show_world):
-    if learner_type == 'learners.human_learner.HumanLearner' \
-            or view_type == 'ConsoleView':
-        return ConsoleView(env, session, serializer, show_world)
+def create_view(view_type, learner_type, env, session, serializer, show_world, use_curses, byte_mode):
+    if not use_curses:
+        from view.win_console import StdInOutView, StdOutView
+        if learner_type.split('.')[0:2] == ['learners', 'human_learner'] \
+           or view_type == 'ConsoleView':
+            return StdInOutView(env, session, serializer, show_world, byte_mode)
+        else:
+            return StdOutView(env, session)
     else:
-        return BaseView(env, session)
+        from view.console import ConsoleView, BaseView
+        if learner_type.split('.')[0:2] == ['learners', 'human_learner'] \
+                or view_type == 'ConsoleView':
+            return ConsoleView(env, session, serializer, show_world, byte_mode)
+        else:
+            return BaseView(env, session)
 
 
-def create_learner(learner_type, serializer, learner_cmd, learner_port=None):
-    if learner_type == 'learners.human_learner.HumanLearner':
-        return learners.human_learner.HumanLearner(serializer)
+def create_learner(learner_type, serializer, learner_cmd, learner_port=None, learner_address=None, byte_mode=False):
+    if learner_type.split('.')[0:2] == ['learners', 'human_learner']:
+        c = learner_type.split('.')[2]
+        if c == 'HumanLearner':
+            return learners.human_learner.HumanLearner(serializer, byte_mode)
+        elif c == 'ImmediateHumanLearner':
+            return learners.human_learner.ImmediateHumanLearner(serializer, byte_mode)
+        elif c == 'HaltOnDotHumanLearner':
+            return learners.human_learner.HaltOnDotHumanLearner(serializer, byte_mode)
     else:
         # dynamically load the class given by learner_type
         # separate the module from the class name
@@ -114,7 +134,7 @@ def create_learner(learner_type, serializer, learner_cmd, learner_port=None):
         c = getattr(m, cname)
         # instantiate the learner
 
-        return c(learner_cmd, learner_port) if 'RemoteLearner' in cname else c()
+        return c(learner_cmd, learner_port, learner_address) if 'RemoteLearner' in cname else c()
 
 
 def create_tasks_from_config(tasks_config_file):

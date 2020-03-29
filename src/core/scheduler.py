@@ -9,8 +9,13 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
+
+import os
 from collections import defaultdict
 import random
+import logging
+
+import sys
 
 
 class RandomTaskScheduler:
@@ -18,6 +23,7 @@ class RandomTaskScheduler:
     A Scheduler provides new tasks every time is asked.
     This is a random scheduler
     '''
+
     def __init__(self, tasks):
         self.tasks = tasks
 
@@ -35,6 +41,7 @@ class SequentialTaskScheduler:
     A Scheduler provides new tasks every time is asked.
     This is a random scheduler
     '''
+
     def __init__(self, tasks):
         self.tasks = tasks
         self.i = 0
@@ -63,16 +70,52 @@ class IncrementalTaskScheduler:
         self.success_threshold = success_threshold
 
     def get_next_task(self):
-        if self.reward_count == self.success_threshold:
+        if self.reward_count >= self.success_threshold:
             self.reward_count = 0
             self.task_ptr = (self.task_ptr + 1) % len(self.tasks)
         return self.tasks[self.task_ptr]
 
     def reward(self, reward):
-        self.reward_count += 1
+        if reward > 0:
+            self.reward_count += reward
+
 
 # TODO: Create a BatchedScheduler that takes as an argument another
 #       scheduler and just repeats the given tasks N times.
+
+
+class ConsecutiveTaskScheduler:
+    '''
+    Switches to the next task type sequentially
+    After the current task was successfully solved N times in row
+    '''
+
+    def __init__(self, tasks, success_threshold=2):
+        self.tasks = tasks
+        self.task_ptr = 0
+        self.reward_count = 0
+        self.success_threshold = success_threshold
+        self.logger = logging.getLogger(__name__)
+
+    def get_next_task(self):
+        if self.reward_count >= self.success_threshold:
+            self.reward_count = 0
+
+            if os.environ.get('UNIT_TESTS_RUNNING'):
+                self.task_ptr = (self.task_ptr + 1) % len(self.tasks)
+            else:
+                self.task_ptr += 1
+
+            if self.task_ptr >= len(self.tasks):
+                self.logger.info("Learning finished successfully!")
+                sys.exit() # you can insert some handler code here.
+                return None
+        return self.tasks[self.task_ptr]
+
+    def reward(self, reward):
+        if reward != 1:
+            self.reward_count = 0
+        self.reward_count += reward
 
 
 class DependenciesTaskScheduler:
@@ -112,7 +155,8 @@ class DependenciesTaskScheduler:
         # remember the amount of times we have solved the task
         # using the name of the class to have a hashable value
         task_name = self.get_task_id(self.last_task)
-        self.rewards[task_name] += reward
+        if reward > 0:
+            self.rewards[task_name] += reward
         if self.rewards[task_name] >= self.unlock_threshold:
             self.solved_tasks.add(task_name)
             # refresh the list of available tasks

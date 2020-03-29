@@ -15,6 +15,7 @@ from core.task import StateChanged, MessageReceived, \
 from core.obs.observer import Observable
 from core.serializer import ScramblingSerializerWrapper
 from core.channels import InputChannel, OutputChannel
+from core.byte_channels import ByteInputChannel, ByteOutputChannel
 from collections import defaultdict
 import logging
 
@@ -34,8 +35,9 @@ class Environment:
     :param max_reward_per_task: maximum amount of reward that a learner can
         receive for a given task.
     '''
+
     def __init__(self, serializer, task_scheduler, scramble=False,
-                 max_reward_per_task=10):
+                 max_reward_per_task=10000, byte_mode=False):
         # save parameters into member variables
         self._task_scheduler = task_scheduler
         self._serializer = serializer
@@ -50,18 +52,31 @@ class Environment:
         # intialize member variables
         self._current_task = None
         self._current_world = None
-        # we hear to our own output
-        self._output_channel_listener = InputChannel(serializer)
+
         if scramble:
             serializer = ScramblingSerializerWrapper(serializer)
-        # output channel
-        self._output_channel = OutputChannel(serializer)
-        # input channel
-        self._input_channel = InputChannel(serializer)
+        if byte_mode:
+            # we hear to our own output
+            self._output_channel_listener = ByteInputChannel(serializer)
+            # output channel
+            self._output_channel = ByteOutputChannel(serializer)
+            # input channel
+            self._input_channel = ByteInputChannel(serializer)
+        else:
+            # we hear to our own output
+            self._output_channel_listener = InputChannel(serializer)
+            # output channel
+            self._output_channel = OutputChannel(serializer)
+            # input channel
+            self._input_channel = InputChannel(serializer)
         # priority of ongoing message
         self._output_priority = 0
         # reward that is to be given at the learner at the end of the task
         self._reward = None
+        self._result = None
+        self._last_result = None
+        # reward that is to be given immediately
+        self._immediate_reward = None
         # Current task time
         self._task_time = None
         # Task separator issued
@@ -86,6 +101,9 @@ class Environment:
     def next(self, learner_input):
         '''Main loop of the Environment. Receives one bit from the learner and
         produces a response (also one bit)'''
+
+        self._last_result = None  # will be set while execution is inside this function or its child tree
+
         # Make sure we have a task
         if not self._current_task:
             self._switch_new_task()
@@ -93,20 +111,24 @@ class Environment:
         # If the task has not reached the end by either Timeout or
         # achieving the goal
         if not self._current_task.has_ended():
+            # We are in the middle of the task, so no rewards are given
+            reward = None
             # Check if a Timeout occurred
             self._current_task.check_timeout(self._task_time)
             # Process the input from the learner and raise events
             if learner_input is not None:
                 # record the input from the learner and deserialize it
                 # TODO this bit is dropped otherwise on a timeout...
-                self._input_channel.consume_bit(learner_input)
-            # We are in the middle of the task, so no rewards are given
-            reward = None
+                self._input_channel.consume(learner_input)
+                # switch to next task immediately if this input caused the task to end
+                # and there is no feedback to output (output_channel is empty)
+                if self._current_task.has_ended() and self._output_channel.is_empty():
+                    self._switch_new_task()
         else:
             # If the task is ended and there is nothing else to say,
             # issue a silence and then return reward and move to next task
             if self._output_channel.is_empty():
-                if self._task_separator_issued:
+                if self._task_separator_issued or self._should_skip_separator():
                     # Have nothing more to say
                     # reward the learner if necessary and switch to new task
                     reward = self._reward if self._reward is not None else 0
@@ -120,22 +142,28 @@ class Environment:
             else:
                 # TODO: decide what to do here.
                 # Should we consume the bit or not?
-                self._input_channel.consume_bit(learner_input)
+                self._input_channel.consume(learner_input)
                 # If there is still something to say, continue saying it
                 reward = None
         # Get one bit from the output buffer and ship it
         if self._output_channel.is_empty():
             self._output_channel.set_message(self._serializer.SILENCE_TOKEN)
-        output = self._output_channel.consume_bit()
+        output = self._output_channel.consume()
 
         # we hear to ourselves
-        self._output_channel_listener.consume_bit(output)
+        self._output_channel_listener.consume(output)
         # advance time
         self._task_time += 1
+
+        if self._immediate_reward is not None and reward is None:
+            reward = self._immediate_reward
+            self._immediate_reward = None
         if reward is not None:
             # process the reward (clearing it if it's not allowed)
             reward = self._allowable_reward(reward)
-            self._task_scheduler.reward(reward)
+        else:
+            reward = 0
+
         return output, reward
 
     def get_reward_per_task(self):
@@ -180,17 +208,32 @@ class Environment:
     def _on_output_message_updated(self, message):
         self.event_manager.raise_event(OutputMessageUpdated(message))
 
-    def set_reward(self, reward, message='', priority=0):
-        '''Sets the reward that is going to be given
-        to the learner once the task has sent all the remaining message'''
-        self._reward = reward
+    def _should_skip_separator(self):
+        return hasattr(self._current_task, 'skip_task_separator') and self._current_task.skip_task_separator
+
+    def set_result(self, result, message='', priority=0, provide_result_as_reward=True):
+        # the following two ifs prevent repeating the same feedback ad infinitum, which otherwise happens in mini-tasks
+        # in case of a repeated invalid input. self._result is set back to None every time a new task is switched.
+        if self._result is True and result is True:
+            return
+        if self._result is False and result is False:
+            return
+
+        if provide_result_as_reward:
+            self._reward = result
+        self._result = result
         self._current_task.end()
-        self.logger.debug('Setting reward {0} with message "{1}"'
+        self.logger.debug('Terminating instance with result {0} with message "{1}"'
                           ' and priority {2}'
-                          .format(reward, message, priority))
+                          .format(result, message, priority))
         # adds a final space to the final message of the task
         # to separate the next task instructions
         self.set_message(message, priority)
+
+    def set_immediate_reward(self, reward):
+        '''Sets the reward immediately'''
+        self._immediate_reward = reward
+        self.logger.debug('Setting immediate reward {}'.format(reward))
 
     def set_message(self, message, priority=0):
         ''' Saves the message in the output buffer so it can be delivered
@@ -198,7 +241,7 @@ class Environment:
         '''
         if self._output_channel.is_empty() or priority >= self._output_priority:
             self.logger.debug('Setting message "{0}" with priority {1}'
-                               .format(message, priority))
+                              .format(message, priority))
             self._output_channel.set_message(message)
             self._output_priority = priority
         else:
@@ -241,6 +284,11 @@ class Environment:
             self._deregister_task_triggers(self._current_task)
 
         # pick a new task
+        if self._result is not None:
+            self._last_result = self._result
+            self._task_scheduler.reward(self._result)
+            self._result = None
+
         self._current_task = self._task_scheduler.get_next_task()
         try:
             # This is to check whether the user didn't mess up in instantiating
